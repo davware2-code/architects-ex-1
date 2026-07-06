@@ -350,6 +350,18 @@ for step in range(max_steps):
 
     
     # TODO: Implement the training step
+    model.train()
+    optimizer.zero_grad()
+    x, y = train_loader.next_batch()
+    x, y = x.to(device), y.to(device)
+    logits, loss = model(x, y)
+    loss.backward()
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    lr = get_lr(step)
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr   
+    optimizer.step()
+    print(f"step {step} | loss: {loss.item():.6f}")
     
     
     if device_type == "cuda":
