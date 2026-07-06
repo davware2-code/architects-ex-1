@@ -336,6 +336,7 @@ def get_lr(it):
 
 # optimize!
 optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=max_lr, device_type=device_type)
+model = torch.compile(model)
 
 # create the log directory we will write checkpoints to and log to
 log_dir = "log"
@@ -348,7 +349,22 @@ for step in range(max_steps):
     t0 = time.time()
     last_step = (step == max_steps - 1)
 
-    
+    if step % 20 == 0 or last_step:
+        # evaluate the loss on val set
+        model.eval()
+        val_loader.reset()
+        with torch.no_grad():
+            val_loss_accum = 0.0
+            val_loss_steps = 20
+            for _ in range(val_loss_steps):
+                x, y = val_loader.next_batch()
+                x, y = x.to(device), y.to(device)
+                with torch.autocast(device_type=device_type, dtype=torch.float16):
+                    logits, loss = model(x, y)
+                val_loss_accum += loss.detach() / val_loss_steps
+                print(f"validation loss: {loss.item():.4f}")
+                with open(log_file, "a") as f:
+                    f.write(f"{step} val {loss.item():.4f}\n")
     # TODO: Implement the training step
     model.train()
     optimizer.zero_grad()
