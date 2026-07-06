@@ -35,10 +35,14 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-        att = F.softmax(att, dim=-1)
-        y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        
+        # att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        # att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+        # att = F.softmax(att, dim=-1)
+        # y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
         # output projection
         y = self.c_proj(y)
@@ -304,7 +308,7 @@ if torch.cuda.is_available():
 
 enc = tiktoken.get_encoding("gpt2")
 
-B = 16 # micro batch size
+B = 32 # micro batch size
 T = 1024 # sequence length
 
 train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="train")
@@ -319,7 +323,7 @@ model.to(device)
 max_lr = 6e-4
 min_lr = max_lr * 0.1
 warmup_steps = 715
-max_steps = 500 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
+max_steps = 1000 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
 
 def get_lr(it):
     # 1) linear warmup for warmup_iters steps
@@ -349,17 +353,17 @@ for step in range(max_steps):
     t0 = time.time()
     last_step = (step == max_steps - 1)
 
-    if step % 20 == 0 or last_step:
+    if step % 100 == 0 or last_step:
         # evaluate the loss on val set
         model.eval()
         val_loader.reset()
         with torch.no_grad():
             val_loss_accum = 0.0
-            val_loss_steps = 20
+            val_loss_steps = 100
             for _ in range(val_loss_steps):
                 x, y = val_loader.next_batch()
                 x, y = x.to(device), y.to(device)
-                with torch.autocast(device_type=device_type, dtype=torch.float16):
+                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
                     logits, loss = model(x, y)
                 val_loss_accum += loss.detach() / val_loss_steps
                 print(f"validation loss: {loss.item():.4f}")
@@ -370,7 +374,7 @@ for step in range(max_steps):
     optimizer.zero_grad()
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device)
-    with torch.amp.autocast(device_type=device_type, dtype=torch.float16):
+    with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
         logits, loss = model(x, y)
     loss.backward()
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -378,7 +382,6 @@ for step in range(max_steps):
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr   
     optimizer.step()
-    print(f"step {step} | loss: {loss.item():.6f}")
     
     
     if device_type == "cuda":
