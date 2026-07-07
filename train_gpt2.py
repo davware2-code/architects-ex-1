@@ -306,10 +306,15 @@ torch.manual_seed(1337)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
-enc = tiktoken.get_encoding("gpt2")
-
+total_batch_size = 524288 # 2**19, ~0.5M, in muber of tokens
 B = 32 # micro batch size
 T = 1024 # sequence length
+assert total_batch_size % (B * T) == 0, "make sure that  total_batch_size is a multiple of B*T"
+grad_accum_steps = total_batch_size // (B * T) # number of gradient accumulation steps
+print(f"total desired batch size: {total_batch_size}")
+print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
+
+enc = tiktoken.get_encoding("gpt2")
 
 train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="train")
 val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="val")
@@ -372,11 +377,15 @@ for step in range(max_steps):
     # TODO: Implement the training step
     model.train()
     optimizer.zero_grad()
-    x, y = train_loader.next_batch()
-    x, y = x.to(device), y.to(device)
-    with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-        logits, loss = model(x, y)
-    loss.backward()
+    loss_accum = 0.0
+    for micro_step in range(grad_accum_steps):
+        x, y = train_loader.next_batch()
+        x, y = x.to(device), y.to(device)
+        with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+            logits, loss = model(x, y)
+        loss = loss / grad_accum_steps # scale the loss to account for gradient accumulation
+        loss_accum += loss.detach()
+        loss.backward()
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     lr = get_lr(step)
     for param_group in optimizer.param_groups:
@@ -390,12 +399,12 @@ for step in range(max_steps):
     # Print loss and token throughput
     t1 = time.time()
     dt = t1 - t0 # time difference in seconds
-    tokens_processed = train_loader.B * train_loader.T * ddp_world_size
+    tokens_processed = train_loader.B * train_loader.T * ddp_world_size * grad_accum_steps
     tokens_per_sec = tokens_processed / dt
     if master_process:
-        print(f"step {step:5d} | loss: {loss.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
+        print(f"step {step:5d} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
         with open(log_file, "a") as f:
-            f.write(f"{step} train {loss.item():.6f}\n")
+            f.write(f"{step} train {loss_accum.item():.6f}\n")
 
 if ddp:
     destroy_process_group()
