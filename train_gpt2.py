@@ -271,6 +271,7 @@ class DataLoaderLite:
 from torch.distributed import init_process_group, destroy_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
+from hf_checkpoint import save_and_upload_checkpoint
 
 # set up DDP (distributed data parallel).
 # torchrun command sets the env variables RANK, LOCAL_RANK, and WORLD_SIZE
@@ -306,13 +307,8 @@ torch.manual_seed(1337)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
-total_batch_size = 524288 # 2**19, ~0.5M, in muber of tokens
-B = 32 # micro batch size
+B = 64 # micro batch size
 T = 1024 # sequence length
-assert total_batch_size % (B * T) == 0, "make sure that  total_batch_size is a multiple of B*T"
-grad_accum_steps = total_batch_size // (B * T) # number of gradient accumulation steps
-print(f"total desired batch size: {total_batch_size}")
-print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
 
 enc = tiktoken.get_encoding("gpt2")
 
@@ -325,10 +321,16 @@ torch.set_float32_matmul_precision('high')
 model = GPT(GPTConfig(vocab_size=50304))
 # model = GPT.from_pretrained("gpt2") # or init from OpenAI GPT-2
 model.to(device)
+model = torch.compile(model)
+
+if ddp:
+    model = DDP(model, device_ids=[ddp_local_rank])
+raw_model = model.module if ddp else model
+
 max_lr = 6e-4
 min_lr = max_lr * 0.1
 warmup_steps = 715
-max_steps = 1000 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
+max_steps = 5000 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
 
 def get_lr(it):
     # 1) linear warmup for warmup_iters steps
@@ -344,8 +346,7 @@ def get_lr(it):
     return min_lr + coeff * (max_lr - min_lr)
 
 # optimize!
-optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=max_lr, device_type=device_type)
-model = torch.compile(model)
+optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=max_lr, device_type=device_type)
 
 # create the log directory we will write checkpoints to and log to
 log_dir = "log"
@@ -354,57 +355,70 @@ log_file = os.path.join(log_dir, f"log.txt")
 with open(log_file, "w") as f: # open for writing to clear the file
     pass
 
+checkpoint_dir = "/mnt/models/davidrs"
+os.makedirs(checkpoint_dir, exist_ok=True)
+
 for step in range(max_steps):
     t0 = time.time()
     last_step = (step == max_steps - 1)
 
-    if step % 100 == 0 or last_step:
+    if step % 1000 == 0 or last_step:
         # evaluate the loss on val set
-        model.eval()
+        raw_model.eval()
         val_loader.reset()
         with torch.no_grad():
             val_loss_accum = 0.0
-            val_loss_steps = 100
+            val_loss_steps = 1000
             for _ in range(val_loss_steps):
                 x, y = val_loader.next_batch()
                 x, y = x.to(device), y.to(device)
                 with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                    logits, loss = model(x, y)
+                    logits, loss = raw_model(x, y)
                 val_loss_accum += loss.detach() / val_loss_steps
-                print(f"validation loss: {loss.item():.4f}")
-                with open(log_file, "a") as f:
-                    f.write(f"{step} val {loss.item():.4f}\n")
-    # TODO: Implement the training step
+        
+        if ddp:
+            dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
+
+        if master_process:
+            print(f"validation loss: {val_loss_accum.item():.4f}")
+            with open(log_file, "a") as f:
+                f.write(f"{step} val {val_loss_accum.item():.4f}\n")
+
+            if step > 0:
+                # save a checkpoint and upload to HuggingFace
+                ckpt_path = save_and_upload_checkpoint(raw_model, step, val_loss_accum.item(), checkpoint_dir)
+                        
+    #Training step
     model.train()
     optimizer.zero_grad()
-    loss_accum = 0.0
-    for micro_step in range(grad_accum_steps):
-        x, y = train_loader.next_batch()
-        x, y = x.to(device), y.to(device)
-        with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-            logits, loss = model(x, y)
-        loss = loss / grad_accum_steps # scale the loss to account for gradient accumulation
-        loss_accum += loss.detach()
-        loss.backward()
+    x, y = train_loader.next_batch()
+    x, y = x.to(device), y.to(device)
+    with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+        logits, loss = model(x, y)
+    loss.backward()
+    loss_val = loss.detach()
+
+    if ddp:
+        dist.all_reduce(loss_val, op=dist.ReduceOp.AVG)
+
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     lr = get_lr(step)
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr   
     optimizer.step()
-    
-    
+        
     if device_type == "cuda":
         torch.cuda.synchronize() # wait for the GPU to finish work
 
     # Print loss and token throughput
     t1 = time.time()
     dt = t1 - t0 # time difference in seconds
-    tokens_processed = train_loader.B * train_loader.T * ddp_world_size * grad_accum_steps
+    tokens_processed = train_loader.B * train_loader.T * ddp_world_size
     tokens_per_sec = tokens_processed / dt
     if master_process:
-        print(f"step {step:5d} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
+        print(f"step {step:5d} | loss: {loss_val.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
         with open(log_file, "a") as f:
-            f.write(f"{step} train {loss_accum.item():.6f}\n")
+            f.write(f"{step} train {loss_val.item():.6f}\n")
 
 if ddp:
     destroy_process_group()
